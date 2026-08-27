@@ -350,6 +350,7 @@ export interface RoomMount {
 
 export const RoomMountTypeEnum = {
     private: 'private',
+    shared: 'shared',
     template: 'template',
     protected: 'protected',
     public: 'public'
@@ -2003,6 +2004,3 @@ export class RoomsApi extends BaseAPI {
         return RoomsApiFp(this.configuration).roomsList(labels, options).then((request) => request(this.axios, this.basePath));
     }
 }
-
-
-

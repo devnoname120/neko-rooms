@@ -37,11 +37,14 @@ Please note, that **neko-rooms** must be aware of external storage path, as it i
 Inside storage path (e.g. `/opt/neko-rooms/data`) there will be available these mount points:
 
 - `/opt/neko-rooms/data/`**`rooms/<room name>/`** where will be stored private room data.
+- `/opt/neko-rooms/data/`**`shared/`** where data shared by multiple rooms will be stored.
 - `/opt/neko-rooms/data/`**`templates/`** where templates will be accessible.
 
 ## How can it be used?
 
 You can mount e.g. browser policies and this way customize browser.
+
+Shared mounts are writable managed storage. Rooms that use the same shared host path see the same data. This can be used to reuse a persistent browser profile, including its cookies, across rooms. Do not run multiple rooms with the same shared browser profile at once, because browsers lock active profiles and concurrent access can corrupt the profile.
 
 You can always refer to [google-chrome Dockerfile](https://github.com/m1k1o/neko/blob/1800d077d8138bdb23c25028bf4201a0469f91aa/.m1k1o/google-chrome/Dockerfile). In this case, policies are mounted to `/etc/opt/chrome/policies/managed/policies.json` path inside container. So you can mount custom file to this location what overwrites its content.
 

@@ -291,11 +291,12 @@
               style="width: 100%"
             >
               <p><strong>Not all mount types are available!</strong></p>
-              <p class="mb-0">Private and Template mounts are not available, because storage is not enabled.</p>
+              <p class="mb-0">Private, Shared and Template mounts are not available, because storage is not enabled.</p>
             </v-alert>
             <p>
               <span :style="{ opacity: !storageEnabled ? 0.25 : 1 }">
                 <strong>Private</strong>: Host path is relative to <code class="mx-1">&lt;storage path&gt;/rooms/&lt;room name&gt;/</code>. <br />
+                <strong>Shared</strong>: Host path is relative to <code class="mx-1">&lt;storage path&gt;/shared/</code> and can be reused by multiple rooms. <br />
                 <strong>Template</strong>: Host path is relative to <code class="mx-1">&lt;storage path&gt;/templates/</code>, and will be readonly. <br />
               </span>
               <strong>Protected</strong>: Host path must be whitelisted in config and exists on the host, will be readonly. <br />
@@ -503,6 +504,20 @@
               ></v-checkbox>
             </v-col>
           </v-row>
+          <v-row align="center" v-if="browserPolicyContent.persistent_data">
+            <v-col>
+              <v-checkbox
+                v-model="shareBrowserProfile"
+                label="Share browser profile between rooms"
+                hide-details
+                class="shrink ml-2 mt-0"
+                :disabled="!browserPolicyEnabled"
+              ></v-checkbox>
+              <div style="margin-left: 41px;">
+                <i>Rooms using the same browser reuse cookies and other browser data. Do not run them at the same time, because browsers lock active profiles.</i>
+              </div>
+            </v-col>
+          </v-row>
         </template>
         <v-alert
           border="left"
@@ -544,7 +559,7 @@
 </template>
 
 <script lang="ts">
-import { Vue, Component, Ref, Watch } from 'vue-property-decorator'
+import { Vue, Component, Ref } from 'vue-property-decorator'
 import { AxiosError } from 'axios'
 import { randomPassword } from '@/utils/random'
 
@@ -581,6 +596,7 @@ export default class RoomsCreate extends Vue {
   public audioPipelineEnabled = false
   public broadcastPipelineEnabled = false
   public browserPolicyEnabled = false
+  public shareBrowserProfile = false
 
   public loading = false
   public loadingWithStart = false
@@ -646,6 +662,10 @@ export default class RoomsCreate extends Vue {
           value: 'private',
         },
         {
+          text: 'Shared',
+          value: 'shared',
+        },
+        {
           text: 'Template',
           value: 'template',
         },
@@ -688,17 +708,17 @@ export default class RoomsCreate extends Vue {
     })
   }
 
-  @Watch('browserPolicyContent.persistent_data')
-  onPersistentDataUpdate(enabled: boolean) {
+  get browserProfileMount(): RoomMount | undefined {
     const config = this.browserPolicyConfig
-    if (!config) return
+    if (!config || !this.browserPolicyEnabled || !this.browserPolicyContent.persistent_data) return undefined
 
-    if (enabled) {
+    return {
+      type: this.shareBrowserProfile ? RoomMountTypeEnum.shared : RoomMountTypeEnum.private,
+      // Use the browser profile path to keep incompatible shared browser profiles separate.
       // eslint-disable-next-line
-      this.data.mounts = [ ...(this.data.mounts || []), { type: RoomMountTypeEnum.private, host_path: '/profile', container_path: config.profile }]
-    } else {
+      host_path: this.shareBrowserProfile ? config.profile : '/profile',
       // eslint-disable-next-line
-      this.data.mounts = (this.data.mounts || []).filter(({ type, container_path }) => type != RoomMountTypeEnum.private && container_path != config.profile)
+      container_path: config.profile,
     }
   }
 
@@ -752,6 +772,11 @@ export default class RoomsCreate extends Vue {
 
     try {
       const envs = this.envList.reduce((obj, { key, val }) => ({ ...obj, [key]: val, }), {})
+      const mounts = [ ...(this.data.mounts || []) ]
+      const browserProfileMount = this.browserProfileMount
+      if (browserProfileMount && !mounts.some(({ container_path }) => container_path == browserProfileMount.container_path)) {
+        mounts.push(browserProfileMount)
+      }
 
       await this.$store.dispatch(start ? 'ROOMS_CREATE_AND_START' : 'ROOMS_CREATE', {
         ...this.data,
@@ -776,6 +801,7 @@ export default class RoomsCreate extends Vue {
         // eslint-disable-next-line
         broadcast_pipeline: this.broadcastPipelineEnabled ? this.data.broadcast_pipeline : '',
         envs,
+        mounts,
         // eslint-disable-next-line
         browser_policy: this.browserPolicyEnabled && this.browserPolicyConfig ? {
           type: this.browserPolicyConfig.type,
@@ -813,6 +839,7 @@ export default class RoomsCreate extends Vue {
       neko_image: this.nekoImages[0],
     }
     this.browserPolicyContent = { ...this.$store.state.defaultBrowserPolicyContent }
+    this.shareBrowserProfile = false
     this.envList = Object.entries({...this.data.envs}).map(([ key, val ]) => ({ key, val, }))
   }
 

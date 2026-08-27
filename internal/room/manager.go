@@ -37,8 +37,9 @@ const (
 	frontendPort        = 8080
 	templateStoragePath = "./templates"
 	privateStoragePath  = "./rooms"
-	privateStorageUid   = 1000
-	privateStorageGid   = 1000
+	sharedStoragePath   = "./shared"
+	managedStorageUid   = 1000
+	managedStorageGid   = 1000
 )
 
 func New(client *dockerClient.Client, config *config.Room) *RoomManagerCtx {
@@ -506,25 +507,30 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 		}
 
 		switch mount.Type {
-		case types.MountPrivate:
+		case types.MountPrivate, types.MountShared:
 			if !manager.config.StorageEnabled {
-				return "", fmt.Errorf("private mounts cannot be specified, because storage is disabled or unavailable")
+				return "", fmt.Errorf("%s mounts cannot be specified, because storage is disabled or unavailable", mount.Type)
+			}
+
+			storagePath, ok := writableStoragePath(mount.Type, roomName, hostPath)
+			if !ok {
+				return "", fmt.Errorf("unknown writable mount type %q", mount.Type)
 			}
 
 			// ensure that target exists with correct permissions
-			internalPath := path.Join(manager.config.StorageInternal, privateStoragePath, roomName, hostPath)
+			internalPath := path.Join(manager.config.StorageInternal, storagePath)
 			if _, err := os.Stat(internalPath); os.IsNotExist(err) {
 				if err := os.MkdirAll(internalPath, os.ModePerm); err != nil {
 					return "", err
 				}
 
-				if err := utils.ChownR(internalPath, privateStorageUid, privateStorageGid); err != nil {
+				if err := utils.ChownR(internalPath, managedStorageUid, managedStorageGid); err != nil {
 					return "", err
 				}
 			}
 
 			// prefix host path
-			hostPath = path.Join(manager.config.StorageExternal, privateStoragePath, roomName, hostPath)
+			hostPath = path.Join(manager.config.StorageExternal, storagePath)
 		case types.MountTemplate:
 			if !manager.config.StorageEnabled {
 				return "", fmt.Errorf("template mounts cannot be specified, because storage is disabled or unavailable")
@@ -754,6 +760,7 @@ func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*typ
 	}
 
 	privateStorageRoot := path.Join(manager.config.StorageExternal, privateStoragePath, labels.Name)
+	sharedStorageRoot := path.Join(manager.config.StorageExternal, sharedStoragePath)
 	templateStorageRoot := path.Join(manager.config.StorageExternal, templateStoragePath)
 
 	mounts := []types.RoomMount{}
@@ -761,12 +768,15 @@ func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*typ
 		mountType := types.MountPublic
 		hostPath := mount.Source
 
-		if strings.HasPrefix(hostPath, privateStorageRoot) {
+		if relativePath, ok := relativeMountPath(hostPath, privateStorageRoot); ok {
 			mountType = types.MountPrivate
-			hostPath = strings.TrimPrefix(hostPath, privateStorageRoot)
-		} else if strings.HasPrefix(hostPath, templateStorageRoot) {
+			hostPath = relativePath
+		} else if relativePath, ok := relativeMountPath(hostPath, sharedStorageRoot); ok {
+			mountType = types.MountShared
+			hostPath = relativePath
+		} else if relativePath, ok := relativeMountPath(hostPath, templateStorageRoot); ok {
 			mountType = types.MountTemplate
-			hostPath = strings.TrimPrefix(hostPath, templateStorageRoot)
+			hostPath = relativePath
 		} else if !mount.RW {
 			mountType = types.MountProtected
 		}

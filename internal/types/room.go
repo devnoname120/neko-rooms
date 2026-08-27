@@ -36,6 +36,7 @@ type MountType string
 
 const (
 	MountPrivate   MountType = "private"
+	MountShared    MountType = "shared"
 	MountTemplate  MountType = "template"
 	MountProtected MountType = "protected"
 	MountPublic    MountType = "public"
