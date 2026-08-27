@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/m1k1o/neko-rooms/internal/config"
 	"github.com/m1k1o/neko-rooms/internal/types"
@@ -28,10 +29,11 @@ type roomReady struct {
 type events struct {
 	wg sync.WaitGroup
 
-	logger             zerolog.Logger
-	config             *config.Room
-	client             *dockerClient.Client
-	onBrowserHostStart func(context.Context, string, string, bool) error
+	logger              zerolog.Logger
+	config              *config.Room
+	client              *dockerClient.Client
+	onBrowserHostStart  func(context.Context, string, string, bool) error
+	onBrowserHostsGuard func(context.Context) error
 
 	roomsReadyCh chan roomReady
 	roomsReadyMu sync.Mutex
@@ -51,12 +53,14 @@ func newEvents(
 	config *config.Room,
 	client *dockerClient.Client,
 	onBrowserHostStart func(context.Context, string, string, bool) error,
+	onBrowserHostsGuard func(context.Context) error,
 ) *events {
 	return &events{
-		logger:             log.With().Str("module", "events").Logger(),
-		config:             config,
-		client:             client,
-		onBrowserHostStart: onBrowserHostStart,
+		logger:              log.With().Str("module", "events").Logger(),
+		config:              config,
+		client:              client,
+		onBrowserHostStart:  onBrowserHostStart,
+		onBrowserHostsGuard: onBrowserHostsGuard,
 
 		roomsReadyCh: make(chan roomReady),
 		roomsReady:   make(map[string]struct{}),
@@ -203,6 +207,25 @@ func (e *events) Start() {
 			}
 		}
 	}()
+
+	if e.onBrowserHostsGuard != nil {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-e.ctx.Done():
+					return
+				case <-ticker.C:
+					if err := e.onBrowserHostsGuard(e.ctx); err != nil && e.ctx.Err() == nil {
+						e.logger.Warn().Err(err).Msg("browser-window guardian reconciliation failed")
+					}
+				}
+			}
+		}()
+	}
 }
 
 func (e *events) recoverBrowserHost(containerID, key string, force bool) {
@@ -222,7 +245,6 @@ func (e *events) recoverBrowserHost(containerID, key string, force bool) {
 
 func (e *events) Shutdown() error {
 	e.cancel()
-	close(e.roomsReadyCh)
 	e.wg.Wait()
 	return nil
 }
@@ -264,9 +286,12 @@ func (e *events) waitForRoomReady(roomId string, labels map[string]string) {
 
 		if strings.HasSuffix(string(data), "OK") {
 			e.logger.Debug().Str("id", roomId).Msg("room ready")
-			e.roomsReadyCh <- roomReady{
+			select {
+			case e.roomsReadyCh <- roomReady{
 				id:     roomId,
 				labels: labels,
+			}:
+			case <-e.ctx.Done():
 			}
 			return
 		}

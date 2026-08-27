@@ -47,11 +47,13 @@ func New(client *dockerClient.Client, config *config.Room) *RoomManagerCtx {
 	logger := log.With().Str("module", "room").Logger()
 
 	manager := &RoomManagerCtx{
-		logger: logger,
-		config: config,
-		client: client,
+		logger:              logger,
+		config:              config,
+		client:              client,
+		browserReservations: make(map[string]map[int]browserWindow),
+		browserHostLeases:   make(map[string]*os.File),
 	}
-	manager.events = newEvents(config, client, manager.recoverBrowserHost)
+	manager.events = newEvents(config, client, manager.recoverBrowserHost, manager.guardBrowserHosts)
 	return manager
 }
 
@@ -62,6 +64,13 @@ type RoomManagerCtx struct {
 	events *events
 
 	browserHostsMu sync.Mutex
+	// Reservations bridge the gap between allocating a browser window and the
+	// room container becoming visible through Docker. Without them, concurrent
+	// Create calls can select the same slot and window.
+	browserReservations map[string]map[int]browserWindow
+	// The open file descriptors hold process-scoped leases in addition to the
+	// persistent owner metadata stored on shared storage.
+	browserHostLeases map[string]*os.File
 }
 
 func (manager *RoomManagerCtx) Config() types.RoomsConfig {
@@ -120,6 +129,9 @@ func (manager *RoomManagerCtx) ExportAsDockerCompose(ctx context.Context) ([]byt
 		labels, err := manager.extractLabels(containerJson.Config.Labels)
 		if err != nil {
 			return nil, err
+		}
+		if labels.BrowserHost != nil {
+			return nil, fmt.Errorf("Docker Compose export is not supported while shared browser-window rooms exist")
 		}
 
 		containerName := containerJson.Name
@@ -256,12 +268,29 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 	}
 
 	browserProfile := manager.browserProfile(&settings)
+	if settings.BrowserPolicy != nil && !settings.BrowserPolicy.Content.PersistentData {
+		for _, mount := range settings.Mounts {
+			if mount.Type == types.MountShared &&
+				filepath.Clean(mount.ContainerPath) == filepath.Clean(settings.BrowserPolicy.Profile) {
+				return "", fmt.Errorf("a shared browser profile mount requires persistent browser data")
+			}
+		}
+	}
 	var browserImageID string
 	if browserProfile != nil {
+		if len(settings.Resources.Gpus) != 0 || len(settings.Resources.Devices) != 0 {
+			return "", fmt.Errorf("GPU and host-device passthrough are not supported by shared browser windows")
+		}
+		if settings.Hostname != "" {
+			return "", fmt.Errorf("custom hostnames are not supported by shared browser windows")
+		}
+		if settings.VideoPipeline != "" || settings.BroadcastPipeline != "" {
+			return "", fmt.Errorf("custom video and broadcast pipelines are not supported by shared browser windows")
+		}
 		profileMounts := 0
 		for _, mount := range settings.Mounts {
 			if filepath.Clean(mount.ContainerPath) != filepath.Clean(browserProfile.ProfilePath) {
-				continue
+				return "", fmt.Errorf("additional mounts are not supported by shared browser windows")
 			}
 			profileMounts++
 			if mount.Type != types.MountShared || filepath.Clean(mount.HostPath) != filepath.Clean(browserProfile.SharedPath) {
@@ -277,6 +306,9 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 		}
 		if inspect.Config.Labels["net.m1k1o.neko.window-rooms"] != "1" {
 			return "", fmt.Errorf("neko image %q does not support shared browser windows", settings.NekoImage)
+		}
+		if inspect.Config.Labels["net.m1k1o.neko.window-rooms-runtime"] != "1" {
+			return "", fmt.Errorf("neko image %q uses an unsupported shared-window runtime flavor", settings.NekoImage)
 		}
 		browserImageID = inspect.ID
 	}
@@ -675,10 +707,11 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 		if err != nil {
 			return "", err
 		}
+		defer manager.releaseBrowserReservation(host)
 
 		for _, target := range []string{browserHostX11Path, browserHostRuntimePath} {
 			if paths[target] {
-				_ = manager.cleanupBrowserHost(ctx, browserHostLabels(host))
+				manager.rollbackBrowserHost(host)
 				return "", fmt.Errorf("mount path %q is reserved for shared browser windows", target)
 			}
 		}
@@ -690,6 +723,10 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 		env = setContainerEnv(env, "NEKO_RUNTIME_XSERVER_ENABLED", "false")
 		env = setContainerEnv(env, "NEKO_RUNTIME_PULSEAUDIO_ENABLED", "false")
 		env = setContainerEnv(env, "NEKO_RUNTIME_APP_ENABLED", "false")
+		env = setContainerEnv(env, "NEKO_RUNTIME_SERVER_ENABLED", "true")
+		env = setContainerEnv(env, "NEKO_FILETRANSFER_ENABLED", "false")
+		env = setContainerEnv(env, "NEKO_DESKTOP_UPLOAD_DROP", "false")
+		env = setContainerEnv(env, "NEKO_DESKTOP_FILE_CHOOSER_DIALOG", "false")
 		env = setContainerEnv(env, "NEKO_DESKTOP_INPUT_ENABLED", "false")
 		windowWidth := host.WindowWidth
 		windowHeight := host.WindowHeight
@@ -800,12 +837,26 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 
 	if err != nil {
 		if host != nil {
-			_ = manager.cleanupBrowserHost(ctx, browserHostLabels(host))
+			manager.rollbackBrowserHost(host)
 		}
 		return "", err
 	}
 
 	return container.ID[:12], nil
+}
+
+func (manager *RoomManagerCtx) rollbackBrowserHost(host *browserHost) {
+	if host == nil {
+		return
+	}
+	manager.releaseBrowserReservation(host)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := manager.cleanupBrowserHost(cleanupCtx, browserHostLabels(host)); err != nil {
+		manager.logger.Warn().Err(err).
+			Str("browser_host", host.ContainerID).
+			Msg("failed to roll back browser host allocation")
+	}
 }
 
 func (manager *RoomManagerCtx) GetEntry(ctx context.Context, id string) (*types.RoomEntry, error) {
@@ -861,7 +912,9 @@ func (manager *RoomManagerCtx) Remove(ctx context.Context, id string) error {
 		return err
 	}
 
-	return manager.cleanupBrowserHost(ctx, labels.BrowserHost)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return manager.cleanupBrowserHost(cleanupCtx, labels.BrowserHost)
 }
 
 func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*types.RoomSettings, error) {

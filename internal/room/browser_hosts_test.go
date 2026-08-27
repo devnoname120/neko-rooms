@@ -3,6 +3,8 @@ package room
 import (
 	"errors"
 	"os"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/m1k1o/neko-rooms/internal/config"
@@ -96,6 +98,33 @@ func TestBrowserWindowForRegionUsesSlotGeometry(t *testing.T) {
 	}
 }
 
+func TestBrowserWindowForAssignmentKeepsTheOriginalWindow(t *testing.T) {
+	windows := []browserWindow{
+		{ID: 11, X: 1288, Y: 0, Width: 1280, Height: 720},
+		{ID: 22, X: 0, Y: 0, Width: 1280, Height: 720},
+	}
+	host := &BrowserHostLabels{WindowID: 11, WindowX: 0, WindowY: 0, WindowWidth: 1280, WindowHeight: 720}
+	window, ok := browserWindowForAssignment(windows, host, map[uint64]struct{}{})
+	if !ok || window.ID != 11 {
+		t.Fatalf("window = (%+v, %v), want moved original window ID 11", window, ok)
+	}
+}
+
+func TestBrowserWindowReservationsMakeAllocationTransactional(t *testing.T) {
+	assigned := []*BrowserHostLabels{{WindowSlot: 0}}
+	reservations := map[int]browserWindow{1: {ID: 22}}
+	slot, ok := firstAvailableBrowserWindowSlot(assigned, reservations)
+	if !ok || slot != 2 {
+		t.Fatalf("slot = (%d, %v), want (2, true)", slot, ok)
+	}
+	for slot := 2; slot < browserHostColumns*browserHostRows; slot++ {
+		reservations[slot] = browserWindow{ID: uint64(slot + 100)}
+	}
+	if slot, ok := firstAvailableBrowserWindowSlot(assigned, reservations); ok {
+		t.Fatalf("full allocation returned slot %d", slot)
+	}
+}
+
 func TestFilterBrowserProcessWindowsIgnoresCrashReporter(t *testing.T) {
 	windows := []browserWindow{
 		{ID: 1, PID: 100, Process: "firefox-bin", Width: 1280, Height: 720},
@@ -160,5 +189,47 @@ func TestBrowserHostLockIsExclusiveAndOwnerChecked(t *testing.T) {
 	}
 	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("lock path still exists after release: %v", err)
+	}
+}
+
+func TestBrowserHostProcessLeaseIsExclusive(t *testing.T) {
+	lockPath := t.TempDir()
+	first, err := acquireBrowserHostLeasePath(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireBrowserHostLeasePath(lockPath); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("second process lease error = %v, want EWOULDBLOCK", err)
+	}
+	if err := syscall.Flock(int(first.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := acquireBrowserHostLeasePath(lockPath)
+	if err != nil {
+		t.Fatalf("lease was not adoptable after release: %v", err)
+	}
+	_ = syscall.Flock(int(second.Fd()), syscall.LOCK_UN)
+	_ = second.Close()
+}
+
+func TestBrowserHostOpenboxConfigStartsWindowsInQuarantine(t *testing.T) {
+	root := t.TempDir()
+	manager := &RoomManagerCtx{config: &config.Room{StorageInternal: root, StorageExternal: "/external"}}
+	source, err := manager.writeBrowserHostOpenboxConfig(strings.Repeat("a", 64), "1280x720@30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != "/external/templates/browser-host-aaaaaaaaaaaa-openbox.xml" {
+		t.Fatalf("source = %q", source)
+	}
+	data, err := os.ReadFile(root + "/templates/browser-host-aaaaaaaaaaaa-openbox.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "<x>3864</x>") || !strings.Contains(string(data), "<maximized>false</maximized>") {
+		t.Fatalf("Openbox quarantine config is incomplete:\n%s", data)
 	}
 }

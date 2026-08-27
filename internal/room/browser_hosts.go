@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
 	"slices"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	dockerMount "github.com/docker/docker/api/types/mount"
 	dockerNetwork "github.com/docker/docker/api/types/network"
 	dockerStrslice "github.com/docker/docker/api/types/strslice"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/m1k1o/neko-rooms/internal/types"
 )
@@ -25,6 +27,7 @@ import (
 const (
 	browserHostX11Path     = "/tmp/.X11-unix"
 	browserHostRuntimePath = "/tmp/neko-runtime"
+	browserHostOpenboxPath = "/etc/neko/openbox-window-rooms.xml"
 	browserHostColumns     = 3
 	browserHostRows        = 2
 	browserHostGutter      = 8
@@ -35,6 +38,11 @@ var browserRoomManagedEnvKeys = []string{
 	"NEKO_RUNTIME_XSERVER_ENABLED",
 	"NEKO_RUNTIME_PULSEAUDIO_ENABLED",
 	"NEKO_RUNTIME_APP_ENABLED",
+	"NEKO_RUNTIME_SERVER_ENABLED",
+	"NEKO_OPENBOX_CONFIG",
+	"NEKO_FILETRANSFER_ENABLED",
+	"NEKO_DESKTOP_UPLOAD_DROP",
+	"NEKO_DESKTOP_FILE_CHOOSER_DIALOG",
 	"NEKO_DESKTOP_INPUT_ENABLED",
 	"NEKO_DESKTOP_WINDOW_ID",
 	"NEKO_DESKTOP_WINDOW_X",
@@ -244,6 +252,11 @@ func (manager *RoomManagerCtx) ensureBrowserHost(
 	}
 	createdHost := false
 	if container == nil {
+		openboxSource, err := manager.writeBrowserHostOpenboxConfig(key, settings.Screen)
+		if err != nil {
+			_ = manager.releaseBrowserHostLock(ctx, key)
+			return nil, err
+		}
 		container, err = manager.createBrowserHost(
 			ctx,
 			key,
@@ -251,15 +264,14 @@ func (manager *RoomManagerCtx) ensureBrowserHost(
 			settings,
 			profile,
 			policySource,
+			openboxSource,
 			x11Volume,
 			runtimeVolume,
 			deviceRequests,
 			devices,
 		)
 		if err != nil {
-			if lockCreated {
-				_ = manager.releaseBrowserHostLock(ctx, key)
-			}
+			_ = manager.releaseBrowserHostLock(ctx, key)
 			return nil, err
 		}
 		createdHost = true
@@ -277,6 +289,12 @@ func (manager *RoomManagerCtx) ensureBrowserHost(
 			}
 			return nil, fmt.Errorf("start browser host: %w", err)
 		}
+	}
+	if err := manager.configureBrowserHostScreen(ctx, container.ID, settings.Screen); err != nil {
+		if createdHost {
+			_ = manager.cleanupBrowserHostLocked(ctx, &BrowserHostLabels{Key: key, ContainerID: container.ID})
+		}
+		return nil, err
 	}
 	if err := manager.recoverBrowserHostLocked(ctx, container.ID, key, false); err != nil {
 		if createdHost {
@@ -316,6 +334,7 @@ func (manager *RoomManagerCtx) createBrowserHost(
 	settings types.RoomSettings,
 	profile browserProfileMount,
 	policySource string,
+	openboxSource string,
 	x11Volume string,
 	runtimeVolume string,
 	deviceRequests []dockerContainer.DeviceRequest,
@@ -332,13 +351,15 @@ func (manager *RoomManagerCtx) createBrowserHost(
 	env = setContainerEnv(env, "NEKO_RUNTIME_XSERVER_ENABLED", "true")
 	env = setContainerEnv(env, "NEKO_RUNTIME_PULSEAUDIO_ENABLED", "true")
 	env = setContainerEnv(env, "NEKO_RUNTIME_APP_ENABLED", "true")
+	env = setContainerEnv(env, "NEKO_RUNTIME_SERVER_ENABLED", "false")
+	env = setContainerEnv(env, "NEKO_OPENBOX_CONFIG", browserHostOpenboxPath)
 	windowWidth, windowHeight, refreshRate, err := parseBrowserHostScreen(settings.Screen)
 	if err != nil {
 		return nil, err
 	}
 	hostScreen := fmt.Sprintf(
 		"%dx%d@%d",
-		(windowWidth+browserHostGutter)*browserHostColumns,
+		(windowWidth+browserHostGutter)*(browserHostColumns+1),
 		(windowHeight+browserHostGutter)*browserHostRows,
 		refreshRate,
 	)
@@ -349,6 +370,7 @@ func (manager *RoomManagerCtx) createBrowserHost(
 		browserHostBind(profile.ExternalPath, profile.ContainerPath, false),
 		browserHostVolume(x11Volume, browserHostX11Path),
 		browserHostVolume(runtimeVolume, browserHostRuntimePath),
+		browserHostBind(openboxSource, browserHostOpenboxPath, true),
 	}
 	if settings.BrowserPolicy != nil && policySource != "" {
 		mounts = append(mounts, browserHostBind(policySource, settings.BrowserPolicy.Path, true))
@@ -360,6 +382,7 @@ func (manager *RoomManagerCtx) createBrowserHost(
 		"m1k1o.neko_rooms.browser_host":           "true",
 		"m1k1o.neko_rooms.browser_host.key":       key,
 		"m1k1o.neko_rooms.browser_host.spec_hash": specHash,
+		"m1k1o.neko_rooms.browser_host.screen":    settings.Screen,
 		"m1k1o.neko_rooms.neko_image":             settings.NekoImage,
 	}
 
@@ -368,6 +391,18 @@ func (manager *RoomManagerCtx) createBrowserHost(
 		Env:      env,
 		Image:    settings.NekoImage,
 		Labels:   labels,
+		Healthcheck: &dockerContainer.HealthConfig{
+			Test: []string{
+				"CMD-SHELL",
+				"supervisorctl status x-server | grep -q RUNNING && " +
+					"supervisorctl status pulseaudio | grep -q RUNNING && " +
+					"supervisorctl status openbox | grep -q RUNNING && " +
+					"DISPLAY=$DISPLAY xdotool search --onlyvisible --name '.+' >/dev/null",
+			},
+			Interval: 10 * time.Second,
+			Timeout:  5 * time.Second,
+			Retries:  8,
+		},
 	}
 	hostConfig := &dockerContainer.HostConfig{
 		RestartPolicy: dockerContainer.RestartPolicy{Name: "unless-stopped"},
@@ -399,6 +434,59 @@ func (manager *RoomManagerCtx) createBrowserHost(
 		State:  "created",
 		Labels: labels,
 	}, nil
+}
+
+func (manager *RoomManagerCtx) writeBrowserHostOpenboxConfig(key, screen string) (string, error) {
+	width, height, _, err := parseBrowserHostScreen(screen)
+	if err != nil {
+		return "", err
+	}
+	quarantineX := browserHostColumns * (width + browserHostGutter)
+	contents := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <application class="*">
+      <decor>no</decor>
+      <maximized>false</maximized>
+      <focus>yes</focus>
+      <layer>normal</layer>
+      <position force="yes">
+        <x>%d</x>
+        <y>0</y>
+        <monitor>1</monitor>
+      </position>
+      <size>
+        <width>%d</width>
+        <height>%d</height>
+      </size>
+    </application>
+  </applications>
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+    <focusLast>yes</focusLast>
+    <underMouse>no</underMouse>
+    <raiseOnFocus>no</raiseOnFocus>
+  </focus>
+  <placement>
+    <policy>Smart</policy>
+    <center>no</center>
+    <monitor>Primary</monitor>
+    <primaryMonitor>1</primaryMonitor>
+  </placement>
+</openbox_config>
+`, quarantineX, width, height)
+
+	templateInternalPath := path.Join(manager.config.StorageInternal, templateStoragePath)
+	if err := os.MkdirAll(templateInternalPath, 0755); err != nil {
+		return "", fmt.Errorf("create browser host Openbox directory: %w", err)
+	}
+	filename := fmt.Sprintf("browser-host-%s-openbox.xml", key[:12])
+	internalPath := path.Join(templateInternalPath, filename)
+	if err := os.WriteFile(internalPath, []byte(contents), 0644); err != nil {
+		return "", fmt.Errorf("write browser host Openbox config: %w", err)
+	}
+	return path.Join(manager.config.StorageExternal, templateStoragePath, filename), nil
 }
 
 func browserHostBind(source, target string, readOnly bool) dockerMount.Mount {
@@ -600,18 +688,9 @@ func (manager *RoomManagerCtx) allocateBrowserWindow(ctx context.Context, contai
 		return browserWindow{}, 0, err
 	}
 
-	occupiedSlots := map[int]struct{}{}
-	for _, host := range assigned {
-		occupiedSlots[host.WindowSlot] = struct{}{}
-	}
-	windowSlot := -1
-	for slot := 0; slot < browserHostColumns*browserHostRows; slot++ {
-		if _, occupied := occupiedSlots[slot]; !occupied {
-			windowSlot = slot
-			break
-		}
-	}
-	if windowSlot == -1 {
+	reservations := manager.browserReservations[key]
+	windowSlot, ok := firstAvailableBrowserWindowSlot(assigned, reservations)
+	if !ok {
 		return browserWindow{}, 0, fmt.Errorf("browser host has reached its %d-window capacity", browserHostColumns*browserHostRows)
 	}
 
@@ -623,9 +702,21 @@ func (manager *RoomManagerCtx) allocateBrowserWindow(ctx context.Context, contai
 		for _, window := range windows {
 			assignedByGeometry := false
 			for _, host := range assigned {
+				if window.ID == host.WindowID {
+					assignedByGeometry = true
+					break
+				}
 				if _, ok := browserWindowForRegion([]browserWindow{window}, host, map[uint64]struct{}{}); ok {
 					assignedByGeometry = true
 					break
+				}
+			}
+			if !assignedByGeometry {
+				for _, reserved := range reservations {
+					if reserved.ID == window.ID {
+						assignedByGeometry = true
+						break
+					}
 				}
 			}
 			if !assignedByGeometry {
@@ -636,6 +727,13 @@ func (manager *RoomManagerCtx) allocateBrowserWindow(ctx context.Context, contai
 				if err != nil {
 					return browserWindow{}, 0, err
 				}
+				if manager.browserReservations[key] == nil {
+					if manager.browserReservations == nil {
+						manager.browserReservations = make(map[string]map[int]browserWindow)
+					}
+					manager.browserReservations[key] = make(map[int]browserWindow)
+				}
+				manager.browserReservations[key][windowSlot] = configured
 				return configured, windowSlot, nil
 			}
 		}
@@ -656,6 +754,78 @@ func (manager *RoomManagerCtx) allocateBrowserWindow(ctx context.Context, contai
 	}
 
 	return browserWindow{}, 0, fmt.Errorf("timed out waiting for a browser window")
+}
+
+func firstAvailableBrowserWindowSlot(assigned []*BrowserHostLabels, reservations map[int]browserWindow) (int, bool) {
+	occupiedSlots := make(map[int]struct{}, len(assigned)+len(reservations))
+	for _, host := range assigned {
+		occupiedSlots[host.WindowSlot] = struct{}{}
+	}
+	for slot := range reservations {
+		occupiedSlots[slot] = struct{}{}
+	}
+	for slot := 0; slot < browserHostColumns*browserHostRows; slot++ {
+		if _, occupied := occupiedSlots[slot]; !occupied {
+			return slot, true
+		}
+	}
+	return 0, false
+}
+
+func (manager *RoomManagerCtx) configureBrowserHostScreen(ctx context.Context, containerID, screen string) error {
+	width, height, rate, err := parseBrowserHostScreen(screen)
+	if err != nil {
+		return err
+	}
+	hostWidth := (width + browserHostGutter) * (browserHostColumns + 1)
+	hostHeight := (height + browserHostGutter) * browserHostRows
+	if hostWidth > 32767 || hostHeight > 32767 {
+		return fmt.Errorf("shared browser host screen %dx%d exceeds X11 limits", hostWidth, hostHeight)
+	}
+	command := fmt.Sprintf(`
+set -e
+current=$(xrandr --current | sed -n '1s/.*current \([0-9]*\) x \([0-9]*\).*/\1x\2/p')
+[ "$current" = "%dx%d" ] && exit 0
+read -r _ mode rest < <(cvt %d %d %d | grep Modeline)
+mode=${mode%%\"}
+mode=${mode#\"}
+if ! xrandr --query | grep -Fq "   $mode "; then
+  xrandr --newmode "$mode" $rest 2>/dev/null || true
+fi
+output=$(xrandr --query | awk '$2 == "connected" { print $1; exit }')
+[ -n "$output" ]
+xrandr --addmode "$output" "$mode" 2>/dev/null || true
+xrandr --output "$output" --mode "$mode"
+`, hostWidth, hostHeight, hostWidth, hostHeight, rate)
+	var lastErr error
+	for attempt := 0; attempt < 150; attempt++ {
+		if _, err := manager.containerExec(ctx, containerID, []string{"bash", "-lc", command}); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("configure browser host screen: %w", lastErr)
+}
+
+func (manager *RoomManagerCtx) releaseBrowserReservation(host *browserHost) {
+	if host == nil {
+		return
+	}
+	manager.browserHostsMu.Lock()
+	defer manager.browserHostsMu.Unlock()
+	reservations := manager.browserReservations[host.Key]
+	if reserved, ok := reservations[host.WindowSlot]; ok && reserved.ID == host.WindowID {
+		delete(reservations, host.WindowSlot)
+	}
+	if len(reservations) == 0 {
+		delete(manager.browserReservations, host.Key)
+	}
 }
 
 func parseBrowserHostScreen(screen string) (width, height, rate int, err error) {
@@ -703,7 +873,7 @@ func (manager *RoomManagerCtx) configureBrowserWindow(
 	window := strconv.FormatUint(windowID, 10)
 	hexWindow := fmt.Sprintf("0x%x", windowID)
 	command := fmt.Sprintf(
-		"wmctrl -i -r %s -b remove,maximized_vert,maximized_horz; sleep 0.1; "+
+		"wmctrl -i -r %s -b remove,maximized_vert,maximized_horz,fullscreen,above; sleep 0.1; "+
 			"xdotool windowsize --sync %s %d %d; xdotool windowmove --sync %s %d %d",
 		hexWindow,
 		window,
@@ -731,7 +901,7 @@ func (manager *RoomManagerCtx) restoreBrowserWindow(
 		window := strconv.FormatUint(windowID, 10)
 		hexWindow := fmt.Sprintf("0x%x", windowID)
 		command := fmt.Sprintf(
-			"wmctrl -i -r %s -b remove,maximized_vert,maximized_horz; sleep 0.1; "+
+			"wmctrl -i -r %s -b remove,maximized_vert,maximized_horz,fullscreen,above; sleep 0.1; "+
 				"xdotool windowsize %s %d %d; xdotool windowmove %s %d %d; sleep 0.2",
 			hexWindow,
 			window,
@@ -792,43 +962,168 @@ func browserWindowForRegion(windows []browserWindow, host *BrowserHostLabels, us
 	return browserWindow{}, false
 }
 
+func browserWindowForAssignment(windows []browserWindow, host *BrowserHostLabels, used map[uint64]struct{}) (browserWindow, bool) {
+	for _, window := range windows {
+		if window.ID == host.WindowID {
+			if _, ok := used[window.ID]; !ok {
+				return window, true
+			}
+		}
+	}
+	for _, window := range windows {
+		if _, ok := used[window.ID]; ok {
+			continue
+		}
+		if window.X == host.WindowX && window.Y == host.WindowY &&
+			window.Width == host.WindowWidth && window.Height == host.WindowHeight {
+			return window, true
+		}
+	}
+	return browserWindow{}, false
+}
+
+func browserWindowHasAssignedGeometry(window browserWindow, host *BrowserHostLabels) bool {
+	return window.X == host.WindowX && window.Y == host.WindowY &&
+		window.Width == host.WindowWidth && window.Height == host.WindowHeight
+}
+
+func (manager *RoomManagerCtx) quarantineBrowserWindow(
+	ctx context.Context,
+	containerID string,
+	window browserWindow,
+	width int,
+	height int,
+) error {
+	quarantineX := browserHostColumns * (width + browserHostGutter)
+	windowID := strconv.FormatUint(window.ID, 10)
+	hexWindow := fmt.Sprintf("0x%x", window.ID)
+	command := fmt.Sprintf(
+		"wmctrl -i -r %s -b remove,maximized_vert,maximized_horz,fullscreen,above; "+
+			"xdotool windowsize --sync %s %d %d; xdotool windowmove --sync %s %d 0; "+
+			"xdotool windowclose %s",
+		hexWindow,
+		windowID,
+		width,
+		height,
+		windowID,
+		quarantineX,
+		windowID,
+	)
+	if _, err := manager.containerExec(ctx, containerID, []string{"bash", "-lc", command}); err != nil {
+		return fmt.Errorf("quarantine browser window: %w", err)
+	}
+	return nil
+}
+
+func (manager *RoomManagerCtx) reconcileBrowserHostLocked(ctx context.Context, containerID, key string) error {
+	rooms, err := manager.browserHostRoomContainers(ctx, key)
+	if err != nil || len(rooms) == 0 {
+		return err
+	}
+	windows, err := manager.browserWindows(ctx, containerID)
+	if err != nil {
+		return err
+	}
+	hostIPC, err := manager.containerIPCNamespace(ctx, containerID)
+	if err != nil {
+		return err
+	}
+
+	used := make(map[uint64]struct{}, len(rooms))
+	missingWindow := false
+	for _, room := range rooms {
+		labels, err := manager.extractLabels(room.Labels)
+		if err != nil {
+			return err
+		}
+		host := labels.BrowserHost
+		window, ok := browserWindowForAssignment(windows, host, used)
+		if !ok {
+			missingWindow = true
+			break
+		}
+		used[window.ID] = struct{}{}
+		if room.State == "running" {
+			roomIPC, err := manager.containerIPCNamespace(ctx, room.ID)
+			if err != nil || roomIPC != hostIPC {
+				missingWindow = true
+				break
+			}
+		}
+		if !browserWindowHasAssignedGeometry(window, host) {
+			if err := manager.restoreBrowserWindow(ctx, containerID, window.ID, host); err != nil {
+				return err
+			}
+		}
+	}
+	if missingWindow {
+		return manager.recoverBrowserHostLocked(ctx, containerID, key, true)
+	}
+
+	for _, reserved := range manager.browserReservations[key] {
+		used[reserved.ID] = struct{}{}
+	}
+	firstLabels, err := manager.extractLabels(rooms[0].Labels)
+	if err != nil {
+		return err
+	}
+	for _, window := range windows {
+		if _, ok := used[window.ID]; ok {
+			continue
+		}
+		if err := manager.quarantineBrowserWindow(
+			ctx,
+			containerID,
+			window,
+			firstLabels.BrowserHost.WindowWidth,
+			firstLabels.BrowserHost.WindowHeight,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (manager *RoomManagerCtx) guardBrowserHosts(ctx context.Context) error {
+	filters := dockerFilters.NewArgs(
+		dockerFilters.Arg("label", fmt.Sprintf("m1k1o.neko_rooms.instance=%s", manager.config.InstanceName)),
+		dockerFilters.Arg("label", "m1k1o.neko_rooms.browser_host=true"),
+	)
+	hosts, err := manager.client.ContainerList(ctx, dockerContainer.ListOptions{Filters: filters})
+	if err != nil {
+		return err
+	}
+	var guardErr error
+	for _, host := range hosts {
+		key := host.Labels["m1k1o.neko_rooms.browser_host.key"]
+		screen := host.Labels["m1k1o.neko_rooms.browser_host.screen"]
+		if key == "" || screen == "" {
+			continue
+		}
+		manager.browserHostsMu.Lock()
+		_, err = manager.acquireBrowserHostLock(ctx, key)
+		if err == nil {
+			err = manager.configureBrowserHostScreen(ctx, host.ID, screen)
+		}
+		if err == nil {
+			err = manager.reconcileBrowserHostLocked(ctx, host.ID, key)
+		}
+		manager.browserHostsMu.Unlock()
+		if err != nil {
+			if guardErr == nil {
+				guardErr = fmt.Errorf("reconcile browser host %s: %w", host.ID[:12], err)
+			}
+		}
+	}
+	return guardErr
+}
+
 func (manager *RoomManagerCtx) containerIPCNamespace(ctx context.Context, containerID string) (string, error) {
 	output, err := manager.containerExec(ctx, containerID, []string{"readlink", "/proc/1/ns/ipc"})
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(output), nil
-}
-
-func (manager *RoomManagerCtx) browserHostNeedsRecovery(
-	ctx context.Context,
-	containerID string,
-	windows []browserWindow,
-	rooms []dockerContainer.Summary,
-) (bool, error) {
-	hostIPC, err := manager.containerIPCNamespace(ctx, containerID)
-	if err != nil {
-		return false, err
-	}
-	used := map[uint64]struct{}{}
-	for _, room := range rooms {
-		labels, err := manager.extractLabels(room.Labels)
-		if err != nil {
-			return false, err
-		}
-		window, ok := browserWindowForRegion(windows, labels.BrowserHost, used)
-		if !ok {
-			return true, nil
-		}
-		used[window.ID] = struct{}{}
-		if room.State == "running" {
-			roomIPC, err := manager.containerIPCNamespace(ctx, room.ID)
-			if err != nil || roomIPC != hostIPC {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
 }
 
 func (manager *RoomManagerCtx) waitForStableBrowserWindows(
@@ -873,10 +1168,27 @@ func (manager *RoomManagerCtx) waitForStableBrowserWindows(
 func (manager *RoomManagerCtx) recoverBrowserHost(ctx context.Context, containerID, key string, force bool) error {
 	manager.browserHostsMu.Lock()
 	defer manager.browserHostsMu.Unlock()
+	if _, err := manager.acquireBrowserHostLock(ctx, key); err != nil {
+		return err
+	}
+	container, err := manager.client.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return err
+	}
+	screen := container.Config.Labels["m1k1o.neko_rooms.browser_host.screen"]
+	if screen == "" {
+		return fmt.Errorf("browser host %s is missing its screen label", containerID[:12])
+	}
+	if err := manager.configureBrowserHostScreen(ctx, containerID, screen); err != nil {
+		return err
+	}
 	return manager.recoverBrowserHostLocked(ctx, containerID, key, force)
 }
 
 func (manager *RoomManagerCtx) recoverBrowserHostLocked(ctx context.Context, containerID, key string, force bool) error {
+	if !force {
+		return manager.reconcileBrowserHostLocked(ctx, containerID, key)
+	}
 	rooms, err := manager.browserHostRoomContainers(ctx, key)
 	if err != nil || len(rooms) == 0 {
 		return err
@@ -893,13 +1205,6 @@ func (manager *RoomManagerCtx) recoverBrowserHostLocked(ctx context.Context, con
 	if err := manager.closeNonBrowserWindows(ctx, containerID); err != nil {
 		return err
 	}
-	if !force {
-		needsRecovery, err := manager.browserHostNeedsRecovery(ctx, containerID, windows, rooms)
-		if err != nil || !needsRecovery {
-			return err
-		}
-	}
-
 	for len(windows) < len(rooms) {
 		windowCount := len(windows)
 		for attempt := 0; attempt < browserWindowAttempts && len(windows) == windowCount; attempt++ {
@@ -987,14 +1292,25 @@ func (manager *RoomManagerCtx) recoverBrowserHostLocked(ctx context.Context, con
 	}
 
 	for _, room := range rooms {
-		if room.State != "running" {
+		wasPaused := room.State == "paused"
+		if room.State != "running" && !wasPaused {
 			continue
+		}
+		if wasPaused {
+			if err := manager.client.ContainerUnpause(ctx, room.ID); err != nil {
+				return fmt.Errorf("unpause room %s for browser host recovery: %w", room.ID[:12], err)
+			}
 		}
 		if err := manager.client.ContainerRestart(ctx, room.ID, dockerContainer.StopOptions{
 			Signal:  "SIGTERM",
 			Timeout: &manager.config.StopTimeoutSec,
 		}); err != nil {
 			return fmt.Errorf("restart room %s after browser host recovery: %w", room.ID[:12], err)
+		}
+		if wasPaused {
+			if err := manager.client.ContainerPause(ctx, room.ID); err != nil {
+				return fmt.Errorf("restore paused room %s after browser host recovery: %w", room.ID[:12], err)
+			}
 		}
 	}
 	manager.logger.Info().
@@ -1012,7 +1328,7 @@ func (manager *RoomManagerCtx) closeBrowserWindow(ctx context.Context, host *Bro
 	if host.WindowWidth > 0 && host.WindowHeight > 0 {
 		windows, err := manager.browserWindows(ctx, host.ContainerID)
 		if err == nil {
-			if window, ok := browserWindowForRegion(windows, host, map[uint64]struct{}{}); ok {
+			if window, ok := browserWindowForAssignment(windows, host, map[uint64]struct{}{}); ok {
 				windowID = window.ID
 			}
 		}
@@ -1044,6 +1360,9 @@ func (manager *RoomManagerCtx) cleanupBrowserHostLocked(ctx context.Context, hos
 			Uint64("window_id", host.WindowID).
 			Msg("failed to close browser window")
 	}
+	if len(manager.browserReservations[host.Key]) != 0 {
+		return nil
+	}
 
 	filters := dockerFilters.NewArgs(
 		dockerFilters.Arg("label", fmt.Sprintf("m1k1o.neko_rooms.instance=%s", manager.config.InstanceName)),
@@ -1060,10 +1379,10 @@ func (manager *RoomManagerCtx) cleanupBrowserHostLocked(ctx context.Context, hos
 	}
 
 	browserContainer, err := manager.findBrowserHost(ctx, host.Key)
-	if err != nil || browserContainer == nil {
+	if err != nil {
 		return err
 	}
-	if browserContainer.State == "running" || browserContainer.State == "paused" {
+	if browserContainer != nil && (browserContainer.State == "running" || browserContainer.State == "paused") {
 		if err := manager.client.ContainerStop(ctx, browserContainer.ID, dockerContainer.StopOptions{
 			Signal:  "SIGTERM",
 			Timeout: &manager.config.StopTimeoutSec,
@@ -1071,13 +1390,15 @@ func (manager *RoomManagerCtx) cleanupBrowserHostLocked(ctx context.Context, hos
 			return err
 		}
 	}
-	if err := manager.client.ContainerRemove(ctx, browserContainer.ID, dockerContainer.RemoveOptions{Force: true}); err != nil {
-		return err
+	if browserContainer != nil {
+		if err := manager.client.ContainerRemove(ctx, browserContainer.ID, dockerContainer.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+			return err
+		}
 	}
 
 	x11Volume, runtimeVolume := manager.browserHostVolumeNames(host.Key)
 	for _, volume := range []string{x11Volume, runtimeVolume} {
-		if err := manager.client.VolumeRemove(ctx, volume, true); err != nil {
+		if err := manager.client.VolumeRemove(ctx, volume, true); err != nil && !errdefs.IsNotFound(err) {
 			return fmt.Errorf("remove browser host volume %q: %w", volume, err)
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +26,12 @@ func (manager *RoomManagerCtx) browserHostLockPath(key string) string {
 }
 
 func (manager *RoomManagerCtx) acquireBrowserHostLock(ctx context.Context, key string) (bool, error) {
+	if manager.browserHostLeases == nil {
+		manager.browserHostLeases = make(map[string]*os.File)
+	}
+	if _, ok := manager.browserHostLeases[key]; ok {
+		return false, nil
+	}
 	info, err := manager.client.Info(ctx)
 	if err != nil {
 		return false, fmt.Errorf("get Docker host identity: %w", err)
@@ -42,7 +49,35 @@ func (manager *RoomManagerCtx) acquireBrowserHostLock(ctx context.Context, key s
 		InstanceName: manager.config.InstanceName,
 		AcquiredAt:   time.Now().UTC(),
 	}
-	return acquireBrowserHostLockPath(manager.browserHostLockPath(key), owner)
+	lockPath := manager.browserHostLockPath(key)
+	created, err := acquireBrowserHostLockPath(lockPath, owner)
+	if err != nil {
+		return false, err
+	}
+	lease, err := acquireBrowserHostLeasePath(lockPath)
+	if err != nil {
+		if created && !errors.Is(err, syscall.EWOULDBLOCK) {
+			_ = os.RemoveAll(lockPath)
+		}
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return false, fmt.Errorf("browser profile %s is already managed by another orchestrator process", key)
+		}
+		return false, fmt.Errorf("acquire browser host process lease: %w", err)
+	}
+	manager.browserHostLeases[key] = lease
+	return created, nil
+}
+
+func acquireBrowserHostLeasePath(lockPath string) (*os.File, error) {
+	lease, err := os.OpenFile(path.Join(lockPath, "lease"), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lease.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lease.Close()
+		return nil, err
+	}
+	return lease, nil
 }
 
 func acquireBrowserHostLockPath(lockPath string, owner browserHostLockOwner) (bool, error) {
@@ -82,11 +117,20 @@ func (manager *RoomManagerCtx) releaseBrowserHostLock(ctx context.Context, key s
 		return fmt.Errorf("get Docker host identity: %w", err)
 	}
 
-	return releaseBrowserHostLockPath(manager.browserHostLockPath(key), browserHostLockOwner{
+	err = releaseBrowserHostLockPath(manager.browserHostLockPath(key), browserHostLockOwner{
 		Key:          key,
 		DockerID:     info.ID,
 		InstanceName: manager.config.InstanceName,
 	})
+	if err != nil {
+		return err
+	}
+	if lease := manager.browserHostLeases[key]; lease != nil {
+		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		_ = lease.Close()
+		delete(manager.browserHostLeases, key)
+	}
+	return nil
 }
 
 func releaseBrowserHostLockPath(lockPath string, expected browserHostLockOwner) error {

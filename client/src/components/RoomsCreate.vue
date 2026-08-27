@@ -504,7 +504,7 @@
               ></v-checkbox>
             </v-col>
           </v-row>
-          <v-row align="center" v-if="browserPolicyContent.persistent_data">
+          <v-row align="center" v-if="browserPolicyContent.persistent_data && browserPolicyConfig.sharedWindows">
             <v-col>
               <v-checkbox
                 v-model="shareBrowserProfile"
@@ -712,11 +712,12 @@ export default class RoomsCreate extends Vue {
     const config = this.browserPolicyConfig
     if (!config || !this.browserPolicyEnabled || !this.browserPolicyContent.persistent_data) return undefined
 
+    const shareBrowserProfile = this.shareBrowserProfile && Boolean(config.sharedWindows)
     return {
-      type: this.shareBrowserProfile ? RoomMountTypeEnum.shared : RoomMountTypeEnum.private,
+      type: shareBrowserProfile ? RoomMountTypeEnum.shared : RoomMountTypeEnum.private,
       // Use the browser profile path to keep incompatible shared browser profiles separate.
       // eslint-disable-next-line
-      host_path: this.shareBrowserProfile ? config.profile : '/profile',
+      host_path: shareBrowserProfile ? config.profile : '/profile',
       // eslint-disable-next-line
       container_path: config.profile,
     }
@@ -774,8 +775,13 @@ export default class RoomsCreate extends Vue {
       const envs = this.envList.reduce((obj, { key, val }) => ({ ...obj, [key]: val, }), {})
       const mounts = [ ...(this.data.mounts || []) ]
       const browserProfileMount = this.browserProfileMount
-      if (browserProfileMount && !mounts.some(({ container_path }) => container_path == browserProfileMount.container_path)) {
-        mounts.push(browserProfileMount)
+      if (browserProfileMount) {
+        const profileMount = mounts.findIndex(({ container_path }) => container_path == browserProfileMount.container_path)
+        if (profileMount >= 0) {
+          mounts.splice(profileMount, 1, browserProfileMount)
+        } else {
+          mounts.push(browserProfileMount)
+        }
       }
 
       await this.$store.dispatch(start ? 'ROOMS_CREATE_AND_START' : 'ROOMS_CREATE', {

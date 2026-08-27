@@ -13,6 +13,7 @@ export interface BrowserPolicyConfig {
   path: string;
   profile: string;
   images: string[];
+  sharedWindows?: boolean;
 }
 
 export interface BrowserPolicyExtensions {
@@ -147,6 +148,7 @@ export const state = {
       path: '/usr/lib/firefox-esr/distribution/policies.json',
       profile: '/home/neko/.mozilla/firefox/profile.default',
       images: [ 'arm-firefox' ],
+      sharedWindows: true,
     },
     // firefox (needs to be after firefox-esr, because it matches all remaining firefox images)
     {
@@ -154,12 +156,20 @@ export const state = {
       path: '/usr/lib/firefox/distribution/policies.json',
       profile: '/home/neko/.mozilla/firefox/profile.default',
       images: [ 'm1k1o/neko:latest', 'firefox' ],
+      sharedWindows: true,
     },
     {
       type: BrowserPolicyTypeEnum.chromium,
       path: '/etc/chromium/policies/managed/policies.json',
       profile: '/home/neko/.config/chromium',
-      images: [ 'chromium', 'ungoogled-chromium' ],
+      images: [ 'chromium' ],
+      sharedWindows: true,
+    },
+    {
+      type: BrowserPolicyTypeEnum.chromium,
+      path: '/etc/chromium/policies/managed/policies.json',
+      profile: '/home/neko/.config/chromium',
+      images: [ 'ungoogled-chromium' ],
     },
     {
       type: BrowserPolicyTypeEnum.chromium,
