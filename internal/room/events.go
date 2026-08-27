@@ -28,9 +28,10 @@ type roomReady struct {
 type events struct {
 	wg sync.WaitGroup
 
-	logger zerolog.Logger
-	config *config.Room
-	client *dockerClient.Client
+	logger             zerolog.Logger
+	config             *config.Room
+	client             *dockerClient.Client
+	onBrowserHostStart func(context.Context, string, string, bool) error
 
 	roomsReadyCh chan roomReady
 	roomsReadyMu sync.Mutex
@@ -46,11 +47,16 @@ type events struct {
 	totalRooms   prometheus.Counter
 }
 
-func newEvents(config *config.Room, client *dockerClient.Client) *events {
+func newEvents(
+	config *config.Room,
+	client *dockerClient.Client,
+	onBrowserHostStart func(context.Context, string, string, bool) error,
+) *events {
 	return &events{
-		logger: log.With().Str("module", "events").Logger(),
-		config: config,
-		client: client,
+		logger:             log.With().Str("module", "events").Logger(),
+		config:             config,
+		client:             client,
+		onBrowserHostStart: onBrowserHostStart,
 
 		roomsReadyCh: make(chan roomReady),
 		roomsReady:   make(map[string]struct{}),
@@ -84,6 +90,12 @@ func (e *events) Start() {
 	}
 
 	for _, container := range containers {
+		if container.Labels["m1k1o.neko_rooms.browser_host"] == "true" {
+			if container.State == "running" {
+				e.recoverBrowserHost(container.ID, container.Labels["m1k1o.neko_rooms.browser_host.key"], false)
+			}
+			continue
+		}
 		e.totalRooms.Inc()
 		if container.State == "running" {
 			e.runningRooms.Inc()
@@ -137,6 +149,12 @@ func (e *events) Start() {
 					ContainerLabels: room.labels,
 				})
 			case msg := <-msgs:
+				if msg.Actor.Attributes["m1k1o.neko_rooms.browser_host"] == "true" {
+					if msg.Action == dockerEvents.ActionStart {
+						e.recoverBrowserHost(msg.Actor.ID, msg.Actor.Attributes["m1k1o.neko_rooms.browser_host.key"], true)
+					}
+					continue
+				}
 				roomId := msg.Actor.ID[:12]
 				labels := msg.Actor.Attributes
 
@@ -183,6 +201,21 @@ func (e *events) Start() {
 					ContainerLabels: labels,
 				})
 			}
+		}
+	}()
+}
+
+func (e *events) recoverBrowserHost(containerID, key string, force bool) {
+	if e.onBrowserHostStart == nil || key == "" {
+		return
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		if err := e.onBrowserHostStart(e.ctx, containerID, key, force); err != nil && e.ctx.Err() == nil {
+			e.logger.Error().Err(err).
+				Str("browser_host", containerID[:12]).
+				Msg("failed to recover browser host")
 		}
 	}()
 }

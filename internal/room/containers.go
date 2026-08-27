@@ -55,10 +55,22 @@ func (manager *RoomManagerCtx) listContainers(ctx context.Context, labels map[st
 		args.Add("label", fmt.Sprintf("m1k1o.neko_rooms.x-%s=%s", key, val))
 	}
 
-	return manager.client.ContainerList(ctx, dockerContainer.ListOptions{
+	containers, err := manager.client.ContainerList(ctx, dockerContainer.ListOptions{
 		All:     true,
 		Filters: args,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	rooms := make([]dockerContainer.Summary, 0, len(containers))
+	for _, container := range containers {
+		if container.Labels["m1k1o.neko_rooms.browser_host"] == "true" {
+			continue
+		}
+		rooms = append(rooms, container)
+	}
+	return rooms, nil
 }
 
 func (manager *RoomManagerCtx) containerFilter(ctx context.Context, args dockerFilters.Args) (*dockerContainer.Summary, error) {
@@ -76,9 +88,13 @@ func (manager *RoomManagerCtx) containerFilter(ctx context.Context, args dockerF
 	if len(containers) == 0 {
 		return nil, types.ErrRoomNotFound
 	}
+	for _, container := range containers {
+		if container.Labels["m1k1o.neko_rooms.browser_host"] != "true" {
+			return &container, nil
+		}
+	}
 
-	container := containers[0]
-	return &container, nil
+	return nil, types.ErrRoomNotFound
 }
 
 func (manager *RoomManagerCtx) containerById(ctx context.Context, id string) (*dockerContainer.Summary, error) {

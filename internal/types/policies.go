@@ -10,6 +10,7 @@ const (
 type BrowserPolicy struct {
 	Type    BrowserPolicyType    `json:"type"`
 	Path    string               `json:"path"`
+	Profile string               `json:"profile,omitempty"`
 	Content BrowserPolicyContent `json:"content"`
 }
 

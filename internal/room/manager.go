@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/cli/opts"
@@ -45,12 +46,13 @@ const (
 func New(client *dockerClient.Client, config *config.Room) *RoomManagerCtx {
 	logger := log.With().Str("module", "room").Logger()
 
-	return &RoomManagerCtx{
+	manager := &RoomManagerCtx{
 		logger: logger,
 		config: config,
 		client: client,
-		events: newEvents(config, client),
 	}
+	manager.events = newEvents(config, client, manager.recoverBrowserHost)
+	return manager
 }
 
 type RoomManagerCtx struct {
@@ -58,6 +60,8 @@ type RoomManagerCtx struct {
 	config *config.Room
 	client *dockerClient.Client
 	events *events
+
+	browserHostsMu sync.Mutex
 }
 
 func (manager *RoomManagerCtx) Config() types.RoomsConfig {
@@ -251,6 +255,32 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 		return "", fmt.Errorf("invalid neko image")
 	}
 
+	browserProfile := manager.browserProfile(&settings)
+	var browserImageID string
+	if browserProfile != nil {
+		profileMounts := 0
+		for _, mount := range settings.Mounts {
+			if filepath.Clean(mount.ContainerPath) != filepath.Clean(browserProfile.ProfilePath) {
+				continue
+			}
+			profileMounts++
+			if mount.Type != types.MountShared || filepath.Clean(mount.HostPath) != filepath.Clean(browserProfile.SharedPath) {
+				return "", fmt.Errorf("shared browser profile path %q has a conflicting mount", browserProfile.ProfilePath)
+			}
+		}
+		if profileMounts != 1 {
+			return "", fmt.Errorf("shared browser profile path %q must have exactly one mount", browserProfile.ProfilePath)
+		}
+		inspect, err := manager.client.ImageInspect(ctx, settings.NekoImage)
+		if err != nil {
+			return "", err
+		}
+		if inspect.Config.Labels["net.m1k1o.neko.window-rooms"] != "1" {
+			return "", fmt.Errorf("neko image %q does not support shared browser windows", settings.NekoImage)
+		}
+		browserImageID = inspect.ID
+	}
+
 	// if api version is not set, try to detect it
 	if settings.ApiVersion == 0 {
 		inspect, err := manager.client.ImageInspect(ctx, settings.NekoImage)
@@ -346,10 +376,12 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 	//
 
 	var browserPolicyLabels *BrowserPolicyLabels
+	var browserPolicySource string
 	if settings.BrowserPolicy != nil {
 		browserPolicyLabels = &BrowserPolicyLabels{
-			Type: settings.BrowserPolicy.Type,
-			Path: settings.BrowserPolicy.Path,
+			Type:    settings.BrowserPolicy.Type,
+			Path:    settings.BrowserPolicy.Path,
+			Profile: settings.BrowserPolicy.Profile,
 		}
 	}
 
@@ -464,6 +496,7 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 		policyPath := fmt.Sprintf("/%s-%s-policy.json", roomName, settings.BrowserPolicy.Type)
 		templateInternalPath := path.Join(manager.config.StorageInternal, templateStoragePath)
 		policyInternalPath := path.Join(templateInternalPath, policyPath)
+		browserPolicySource = path.Join(manager.config.StorageExternal, templateStoragePath, policyPath)
 
 		// create dir if does not exist
 		if _, err := os.Stat(templateInternalPath); os.IsNotExist(err) {
@@ -492,19 +525,22 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 	paths := map[string]bool{}
 	mounts := []dockerMount.Mount{}
 	for _, mount := range settings.Mounts {
+		hostPath := filepath.Clean(mount.HostPath)
+		containerPath := filepath.Clean(mount.ContainerPath)
+
 		// ignore duplicates
-		if _, ok := paths[mount.ContainerPath]; ok {
+		if _, ok := paths[containerPath]; ok {
 			continue
 		}
 
 		readOnly := false
 
-		hostPath := filepath.Clean(mount.HostPath)
-		containerPath := filepath.Clean(mount.ContainerPath)
-
 		if !filepath.IsAbs(hostPath) || !filepath.IsAbs(containerPath) {
 			return "", fmt.Errorf("mount paths must be absolute")
 		}
+		isBrowserProfile := browserProfile != nil &&
+			mount.Type == types.MountShared &&
+			containerPath == path.Clean(browserProfile.ProfilePath)
 
 		switch mount.Type {
 		case types.MountPrivate, types.MountShared:
@@ -561,6 +597,14 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 			return "", fmt.Errorf("unknown mount type %q", mount.Type)
 		}
 
+		// A shared browser profile is mounted only in its browser-host
+		// container. The room container attaches to one window from that host.
+		if isBrowserProfile {
+			browserProfile.ExternalPath = hostPath
+			paths[containerPath] = true
+			continue
+		}
+
 		mounts = append(mounts,
 			dockerMount.Mount{
 				Type:        dockerMount.TypeBind,
@@ -576,7 +620,7 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 			},
 		)
 
-		paths[mount.ContainerPath] = true
+		paths[containerPath] = true
 	}
 
 	//
@@ -615,6 +659,63 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 			PathInContainer:   device,
 			CgroupPermissions: "rwm",
 		})
+	}
+
+	var host *browserHost
+	if browserProfile != nil {
+		host, err = manager.ensureBrowserHost(
+			ctx,
+			settings,
+			*browserProfile,
+			browserImageID,
+			browserPolicySource,
+			deviceRequests,
+			devices,
+		)
+		if err != nil {
+			return "", err
+		}
+
+		for _, target := range []string{browserHostX11Path, browserHostRuntimePath} {
+			if paths[target] {
+				_ = manager.cleanupBrowserHost(ctx, browserHostLabels(host))
+				return "", fmt.Errorf("mount path %q is reserved for shared browser windows", target)
+			}
+		}
+		mounts = append(mounts,
+			browserHostVolume(host.X11Volume, browserHostX11Path),
+			browserHostVolume(host.RuntimeVolume, browserHostRuntimePath),
+		)
+
+		env = setContainerEnv(env, "NEKO_RUNTIME_XSERVER_ENABLED", "false")
+		env = setContainerEnv(env, "NEKO_RUNTIME_PULSEAUDIO_ENABLED", "false")
+		env = setContainerEnv(env, "NEKO_RUNTIME_APP_ENABLED", "false")
+		env = setContainerEnv(env, "NEKO_DESKTOP_INPUT_ENABLED", "false")
+		windowWidth := host.WindowWidth
+		windowHeight := host.WindowHeight
+		windowX := host.WindowX
+		windowY := host.WindowY
+		env = setContainerEnv(env, "NEKO_DESKTOP_WINDOW_ID", "0")
+		env = setContainerEnv(env, "NEKO_DESKTOP_WINDOW_X", strconv.Itoa(windowX))
+		env = setContainerEnv(env, "NEKO_DESKTOP_WINDOW_Y", strconv.Itoa(windowY))
+		env = setContainerEnv(env, "NEKO_DESKTOP_WINDOW_WIDTH", strconv.Itoa(windowWidth))
+		env = setContainerEnv(env, "NEKO_DESKTOP_WINDOW_HEIGHT", strconv.Itoa(windowHeight))
+		env = setContainerEnv(env, "NEKO_CAPTURE_VIDEO_WINDOW_ID", "0")
+		env = setContainerEnv(env, "NEKO_CAPTURE_VIDEO_WINDOW_X", strconv.Itoa(windowX))
+		env = setContainerEnv(env, "NEKO_CAPTURE_VIDEO_WINDOW_Y", strconv.Itoa(windowY))
+		env = setContainerEnv(env, "NEKO_CAPTURE_VIDEO_WINDOW_WIDTH", strconv.Itoa(windowWidth))
+		env = setContainerEnv(env, "NEKO_CAPTURE_VIDEO_WINDOW_HEIGHT", strconv.Itoa(windowHeight))
+
+		labels["m1k1o.neko_rooms.browser_host.key"] = host.Key
+		labels["m1k1o.neko_rooms.browser_host.container_id"] = host.ContainerID
+		labels["m1k1o.neko_rooms.browser_host.window_id"] = strconv.FormatUint(host.WindowID, 10)
+		labels["m1k1o.neko_rooms.browser_host.window_slot"] = strconv.Itoa(host.WindowSlot)
+		labels["m1k1o.neko_rooms.browser_host.window_x"] = strconv.Itoa(host.WindowX)
+		labels["m1k1o.neko_rooms.browser_host.window_y"] = strconv.Itoa(host.WindowY)
+		labels["m1k1o.neko_rooms.browser_host.window_width"] = strconv.Itoa(host.WindowWidth)
+		labels["m1k1o.neko_rooms.browser_host.window_height"] = strconv.Itoa(host.WindowHeight)
+		labels["m1k1o.neko_rooms.browser_host.shared_path"] = host.SharedPath
+		labels["m1k1o.neko_rooms.browser_host.profile_path"] = host.ProfilePath
 	}
 
 	//
@@ -675,6 +776,11 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 		// Privileged
 		Privileged: slices.Contains(manager.config.NekoPrivilegedImages, settings.NekoImage),
 	}
+	if host != nil {
+		hostConfig.IpcMode = dockerContainer.IpcMode("container:" + host.ContainerID)
+		// The room shares the browser host's /dev/shm through its IPC namespace.
+		hostConfig.ShmSize = 0
+	}
 
 	networkingConfig := &dockerNetwork.NetworkingConfig{
 		EndpointsConfig: map[string]*dockerNetwork.EndpointSettings{
@@ -693,6 +799,9 @@ func (manager *RoomManagerCtx) Create(ctx context.Context, settings types.RoomSe
 	)
 
 	if err != nil {
+		if host != nil {
+			_ = manager.cleanupBrowserHost(ctx, browserHostLabels(host))
+		}
 		return "", err
 	}
 
@@ -724,7 +833,11 @@ func (manager *RoomManagerCtx) GetEntryByName(ctx context.Context, name string) 
 }
 
 func (manager *RoomManagerCtx) Remove(ctx context.Context, id string) error {
-	_, err := manager.inspectContainer(ctx, id)
+	container, err := manager.inspectContainer(ctx, id)
+	if err != nil {
+		return err
+	}
+	labels, err := manager.extractLabels(container.Config.Labels)
 	if err != nil {
 		return err
 	}
@@ -744,8 +857,11 @@ func (manager *RoomManagerCtx) Remove(ctx context.Context, id string) error {
 		RemoveVolumes: true,
 		Force:         true,
 	})
+	if err != nil {
+		return err
+	}
 
-	return err
+	return manager.cleanupBrowserHost(ctx, labels.BrowserHost)
 }
 
 func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*types.RoomSettings, error) {
@@ -765,6 +881,10 @@ func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*typ
 
 	mounts := []types.RoomMount{}
 	for _, mount := range container.Mounts {
+		if labels.BrowserHost != nil &&
+			(mount.Destination == browserHostX11Path || mount.Destination == browserHostRuntimePath) {
+			continue
+		}
 		mountType := types.MountPublic
 		hostPath := mount.Source
 
@@ -787,12 +907,20 @@ func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*typ
 			ContainerPath: mount.Destination,
 		})
 	}
+	if labels.BrowserHost != nil {
+		mounts = append(mounts, types.RoomMount{
+			Type:          types.MountShared,
+			HostPath:      labels.BrowserHost.SharedPath,
+			ContainerPath: labels.BrowserHost.ProfilePath,
+		})
+	}
 
 	var browserPolicy *types.BrowserPolicy
 	if labels.BrowserPolicy != nil {
 		browserPolicy = &types.BrowserPolicy{
-			Type: labels.BrowserPolicy.Type,
-			Path: labels.BrowserPolicy.Path,
+			Type:    labels.BrowserPolicy.Type,
+			Path:    labels.BrowserPolicy.Path,
+			Profile: labels.BrowserPolicy.Profile,
 		}
 
 		var policyMount *types.RoomMount
@@ -876,6 +1004,11 @@ func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*typ
 			Gpus:      gpus,
 			Devices:   devices,
 		}
+		if labels.BrowserHost != nil {
+			if hostContainer, err := manager.inspectContainer(ctx, labels.BrowserHost.ContainerID); err == nil && hostContainer.HostConfig != nil {
+				roomResources.ShmSize = hostContainer.HostConfig.ShmSize
+			}
+		}
 	}
 
 	settings := types.RoomSettings{
@@ -895,8 +1028,15 @@ func (manager *RoomManagerCtx) GetSettings(ctx context.Context, id string) (*typ
 		settings.MaxConnections = 0
 	}
 
-	err = settings.FromEnv(labels.ApiVersion, container.Config.Env)
-	return &settings, err
+	if err := settings.FromEnv(labels.ApiVersion, container.Config.Env); err != nil {
+		return nil, err
+	}
+	if labels.BrowserHost != nil {
+		for _, key := range browserRoomManagedEnvKeys {
+			delete(settings.Envs, key)
+		}
+	}
+	return &settings, nil
 }
 
 func (manager *RoomManagerCtx) GetStats(ctx context.Context, id string) (*types.RoomStats, error) {

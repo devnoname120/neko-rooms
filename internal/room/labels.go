@@ -21,12 +21,27 @@ type RoomLabels struct {
 	ApiVersion int
 
 	BrowserPolicy *BrowserPolicyLabels
+	BrowserHost   *BrowserHostLabels
 	UserDefined   map[string]string
 }
 
 type BrowserPolicyLabels struct {
-	Type types.BrowserPolicyType
-	Path string
+	Type    types.BrowserPolicyType
+	Path    string
+	Profile string
+}
+
+type BrowserHostLabels struct {
+	Key          string
+	ContainerID  string
+	WindowID     uint64
+	WindowSlot   int
+	WindowX      int
+	WindowY      int
+	WindowWidth  int
+	WindowHeight int
+	SharedPath   string
+	ProfilePath  string
 }
 
 func (manager *RoomManagerCtx) extractLabels(labels map[string]string) (*RoomLabels, error) {
@@ -113,8 +128,81 @@ func (manager *RoomManagerCtx) extractLabels(labels map[string]string) (*RoomLab
 		}
 
 		browserPolicy = &BrowserPolicyLabels{
-			Type: types.BrowserPolicyType(policyType),
-			Path: policyPath,
+			Type:    types.BrowserPolicyType(policyType),
+			Path:    policyPath,
+			Profile: labels["m1k1o.neko_rooms.browser_policy.profile"],
+		}
+	}
+
+	var browserHost *BrowserHostLabels
+	if key, ok := labels["m1k1o.neko_rooms.browser_host.key"]; ok {
+		containerID, ok := labels["m1k1o.neko_rooms.browser_host.container_id"]
+		if !ok {
+			return nil, fmt.Errorf("damaged container labels: browser_host.container_id not found")
+		}
+		windowIDValue, ok := labels["m1k1o.neko_rooms.browser_host.window_id"]
+		if !ok {
+			return nil, fmt.Errorf("damaged container labels: browser_host.window_id not found")
+		}
+		windowID, err := strconv.ParseUint(windowIDValue, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_id: %w", err)
+		}
+		sharedPath, ok := labels["m1k1o.neko_rooms.browser_host.shared_path"]
+		if !ok {
+			return nil, fmt.Errorf("damaged container labels: browser_host.shared_path not found")
+		}
+		profilePath, ok := labels["m1k1o.neko_rooms.browser_host.profile_path"]
+		if !ok {
+			return nil, fmt.Errorf("damaged container labels: browser_host.profile_path not found")
+		}
+		windowSlot, err := strconv.Atoi(labels["m1k1o.neko_rooms.browser_host.window_slot"])
+		if err != nil {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_slot: %w", err)
+		}
+		if windowSlot < 0 || windowSlot >= browserHostColumns*browserHostRows {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_slot: %d", windowSlot)
+		}
+		windowX, err := strconv.Atoi(labels["m1k1o.neko_rooms.browser_host.window_x"])
+		if err != nil {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_x: %w", err)
+		}
+		if windowX < 0 {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_x: %d", windowX)
+		}
+		windowY, err := strconv.Atoi(labels["m1k1o.neko_rooms.browser_host.window_y"])
+		if err != nil {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_y: %w", err)
+		}
+		if windowY < 0 {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_y: %d", windowY)
+		}
+		windowWidth, err := strconv.Atoi(labels["m1k1o.neko_rooms.browser_host.window_width"])
+		if err != nil {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_width: %w", err)
+		}
+		if windowWidth <= 0 {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_width: %d", windowWidth)
+		}
+		windowHeight, err := strconv.Atoi(labels["m1k1o.neko_rooms.browser_host.window_height"])
+		if err != nil {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_height: %w", err)
+		}
+		if windowHeight <= 0 {
+			return nil, fmt.Errorf("damaged container labels: invalid browser_host.window_height: %d", windowHeight)
+		}
+
+		browserHost = &BrowserHostLabels{
+			Key:          key,
+			ContainerID:  containerID,
+			WindowID:     windowID,
+			WindowSlot:   windowSlot,
+			WindowX:      windowX,
+			WindowY:      windowY,
+			WindowWidth:  windowWidth,
+			WindowHeight: windowHeight,
+			SharedPath:   sharedPath,
+			ProfilePath:  profilePath,
 		}
 	}
 
@@ -136,6 +224,7 @@ func (manager *RoomManagerCtx) extractLabels(labels map[string]string) (*RoomLab
 		ApiVersion: apiVersion,
 
 		BrowserPolicy: browserPolicy,
+		BrowserHost:   browserHost,
 		UserDefined:   userDefined,
 	}, nil
 }
@@ -164,6 +253,22 @@ func (manager *RoomManagerCtx) serializeLabels(labels RoomLabels) map[string]str
 		labelsMap["m1k1o.neko_rooms.browser_policy"] = "true"
 		labelsMap["m1k1o.neko_rooms.browser_policy.type"] = string(labels.BrowserPolicy.Type)
 		labelsMap["m1k1o.neko_rooms.browser_policy.path"] = labels.BrowserPolicy.Path
+		if labels.BrowserPolicy.Profile != "" {
+			labelsMap["m1k1o.neko_rooms.browser_policy.profile"] = labels.BrowserPolicy.Profile
+		}
+	}
+
+	if labels.BrowserHost != nil {
+		labelsMap["m1k1o.neko_rooms.browser_host.key"] = labels.BrowserHost.Key
+		labelsMap["m1k1o.neko_rooms.browser_host.container_id"] = labels.BrowserHost.ContainerID
+		labelsMap["m1k1o.neko_rooms.browser_host.window_id"] = strconv.FormatUint(labels.BrowserHost.WindowID, 10)
+		labelsMap["m1k1o.neko_rooms.browser_host.window_slot"] = strconv.Itoa(labels.BrowserHost.WindowSlot)
+		labelsMap["m1k1o.neko_rooms.browser_host.window_x"] = strconv.Itoa(labels.BrowserHost.WindowX)
+		labelsMap["m1k1o.neko_rooms.browser_host.window_y"] = strconv.Itoa(labels.BrowserHost.WindowY)
+		labelsMap["m1k1o.neko_rooms.browser_host.window_width"] = strconv.Itoa(labels.BrowserHost.WindowWidth)
+		labelsMap["m1k1o.neko_rooms.browser_host.window_height"] = strconv.Itoa(labels.BrowserHost.WindowHeight)
+		labelsMap["m1k1o.neko_rooms.browser_host.shared_path"] = labels.BrowserHost.SharedPath
+		labelsMap["m1k1o.neko_rooms.browser_host.profile_path"] = labels.BrowserHost.ProfilePath
 	}
 
 	for key, val := range labels.UserDefined {

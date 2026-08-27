@@ -643,6 +643,10 @@ components:
         path:
           type: string
           example: /usr/lib/firefox/distribution/policies.json
+        profile:
+          type: string
+          example: /home/neko/.mozilla/firefox/profile.default
+          description: Browser profile directory. A shared mount at this path is hosted by one browser process and exposed as separate room windows.
         content:
           $ref: '#/components/schemas/BrowserPolicyContent'
 

@@ -42,6 +42,12 @@ export interface BrowserPolicy {
      */
     'path'?: string;
     /**
+     * Browser profile directory. A shared mount at this path is hosted by one browser process and exposed as separate room windows.
+     * @type {string}
+     * @memberof BrowserPolicy
+     */
+    'profile'?: string;
+    /**
      * 
      * @type {BrowserPolicyContent}
      * @memberof BrowserPolicy

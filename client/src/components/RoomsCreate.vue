@@ -514,7 +514,7 @@
                 :disabled="!browserPolicyEnabled"
               ></v-checkbox>
               <div style="margin-left: 41px;">
-                <i>Rooms using the same browser reuse cookies and other browser data. Do not run them at the same time, because browsers lock active profiles.</i>
+                <i>Up to six rooms run in parallel as windows of one browser host, with live shared cookies and browser data. Browser-wide audio and clipboard state are shared too. The selected Neko image must support shared browser windows.</i>
               </div>
             </v-col>
           </v-row>
@@ -806,6 +806,7 @@ export default class RoomsCreate extends Vue {
         browser_policy: this.browserPolicyEnabled && this.browserPolicyConfig ? {
           type: this.browserPolicyConfig.type,
           path: this.browserPolicyConfig.path,
+          profile: this.browserPolicyConfig.profile,
           content: this.browserPolicyContent
         } : undefined,
       })
